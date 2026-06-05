@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-KuCoin Trend Trader — Same strategy as IQ Option bot.
-Follow trend: 2+ consecutive 5min candles → buy WITH streak
-Martingale: $20 → $40 → $80 with signal revalidation
+KuCoin Grid Trader — Automatic buy/sell grid levels.
+Buys when price drops, sells when it rises. Profits from sideways movement.
 """
 
 import time
@@ -15,14 +14,13 @@ from datetime import datetime
 sys.path.insert(0, '/opt/baal-agent/workspace/kucoin-bot')
 
 from config import (
-    SYMBOLS, TRADE_USD, CANDLE_INTERVAL, CANDLE_COUNT,
-    CONSECUTIVE, POLL_SECONDS, COOLDOWN_SECONDS,
+    SYMBOLS, GRID_LEVELS, GRID_SPREAD_PCT, GRID_TRADE_USD,
+    GRID_MIN_PCT, POLL_SECONDS, GRID_COOLDOWN,
     MAX_DAILY_TRADES, DAILY_STOP_LOSS, DAILY_TAKE_PROFIT,
-    TAKE_PROFIT_PCT, STOP_LOSS_PCT, STATE_FILE, LOG_FILE,
-    MARTINGALE_MAX, MARTINGALE_MULT,
-    MIN_CANDLE_RANGE_PCT,
+    REBALANCE_INTERVAL, REBALANCE_THRESHOLD,
+    STATE_FILE, LOG_FILE,
 )
-from strategy import get_signal, signal_label
+from strategy import build_grid, check_grid_fills, calc_profit_pct, grid_summary
 from kucoin import KuCoinClient
 
 # ── Logging ──────────────────────────────────────────
@@ -47,9 +45,9 @@ class State:
         self.daily_pnl = 0.0
         self.last_date = None
         self.log = []
-        self.cooldowns = {}
-        self.pending = {}
-        self.open_positions = {}
+        self.cooldowns = {}         # {level: timestamp}
+        self.grid_levels = []       # Current grid state
+        self.last_rebalance = 0    # timestamp
 
     def reset_daily(self):
         today = datetime.now().strftime('%Y-%m-%d')
@@ -67,6 +65,8 @@ class State:
                 'pnl': round(self.pnl, 2), 'daily_trades': self.daily_trades,
                 'daily_pnl': round(self.daily_pnl, 2),
                 'log': self.log[-200:],
+                'grid_levels': self.grid_levels,
+                'last_rebalance': self.last_rebalance,
                 'saved_at': datetime.now().isoformat(),
             }
             tmp = STATE_FILE + '.tmp'
@@ -87,6 +87,8 @@ class State:
             self.daily_trades = data.get('daily_trades', 0)
             self.daily_pnl = data.get('daily_pnl', 0.0)
             self.log = data.get('log', [])
+            self.grid_levels = data.get('grid_levels', [])
+            self.last_rebalance = data.get('last_rebalance', 0)
             self.last_date = datetime.now().strftime('%Y-%m-%d')
             if self.trades:
                 log.info(f"📂 Loaded: {self.trades} trades, PnL ${self.pnl:+.2f}")
@@ -102,11 +104,11 @@ s.reset_daily()
 def now_str():
     return datetime.now().strftime('%H:%M:%S')
 
-def in_cooldown(symbol):
-    return time.time() < s.cooldowns.get(symbol, 0)
+def in_cooldown(level):
+    return time.time() < s.cooldowns.get(level, 0)
 
-def set_cooldown(symbol):
-    s.cooldowns[symbol] = time.time() + COOLDOWN_SECONDS
+def set_cooldown(level):
+    s.cooldowns[level] = time.time() + GRID_COOLDOWN
 
 def limits_ok():
     if s.daily_trades >= MAX_DAILY_TRADES:
@@ -120,7 +122,7 @@ def limits_ok():
         return False
     return True
 
-def record_trade(symbol, direction, amount, won, net):
+def record_trade(symbol, direction, amount, buy_price, sell_price, won, net):
     s.trades += 1
     s.daily_trades += 1
     s.pnl += net
@@ -131,166 +133,137 @@ def record_trade(symbol, direction, amount, won, net):
         s.losses += 1
 
     label = "WON" if won else "LOST"
-    log.info(f"  ✅ {label} {symbol} {direction} ${amount} PnL ${net:+.2f} | Total ${s.pnl:+.2f}")
+    profit_pct = calc_profit_pct(buy_price, sell_price) if buy_price else 0
+    log.info(
+        f"  ✅ {label} {symbol} {direction} ${amount:.2f} "
+        f"buy@${buy_price:.2f} sell@${sell_price:.2f} "
+        f"(+{profit_pct:.1f}%) PnL ${net:+.2f} | Total ${s.pnl:+.2f}"
+    )
 
     s.log.append({
         't': now_str(), 'a': symbol, 'd': direction,
-        '$': amount, 'win': won, 'pnl': round(net, 2)
+        '$': amount, 'bp': buy_price, 'sp': sell_price,
+        'win': won, 'pnl': round(net, 2)
     })
 
-# ── Martingale Controlado (same as IQ bot) ───────────
-def martingale_loop(ku, symbol, direction):
-    """
-    Martingale with signal revalidation at each step:
-    - Before each retry, recheck signal
-    - If signal changed or weakened → abort
-    - If signal confirms same direction with strength ≥ min → continue
-    """
-    for step in range(2, MARTINGALE_MAX + 1):
-        if not limits_ok():
-            return
+# ── Grid Initialization ──────────────────────────────
+def init_grid(ku, symbol):
+    """Build or rebuild grid levels around current price."""
+    price = ku.get_price(symbol)
+    grid = build_grid(price, GRID_LEVELS, GRID_SPREAD_PCT)
+    s.grid_levels = grid
+    s.last_rebalance = time.time()
 
-        amount = TRADE_USD * (MARTINGALE_MULT ** (step - 1))
+    log.info("=" * 60)
+    log.info(f"📐 Grid initialized at ${price:.2f} — {GRID_LEVELS} levels, {GRID_SPREAD_PCT}% spread")
+    for g in grid:
+        profit = calc_profit_pct(g['buy_price'], g['sell_price'])
+        marker = "🔵" if not g['bought'] else "🔴"
+        log.info(
+            f"  {marker} L{g['level']:d}: buy ${g['buy_price']:.2f} → sell ${g['sell_price']:.2f} "
+            f"(+{profit:.1f}%, ${GRID_TRADE_USD})"
+        )
+    log.info("=" * 60)
+    return grid
 
-        log.info(f"  🔁 Martingale step {step}: revalidating signal...")
-        time.sleep(5)
-
-        try:
-            klines = ku.get_klines(symbol, CANDLE_INTERVAL, CANDLE_COUNT)
-            new_sig, new_strength = get_signal(klines, CONSECUTIVE, MIN_CANDLE_RANGE_PCT)
-
-            if new_sig is None or new_sig != direction:
-                log.info(f"  ⛔ Signal changed (got: {new_sig}/{new_strength}), aborting martingale")
-                set_cooldown(symbol)
-                return
-
-            if new_strength < CONSECUTIVE:
-                log.info(f"  ⛔ Signal weak ({new_strength} < {CONSECUTIVE}), aborting martingale")
-                set_cooldown(symbol)
-                return
-
-            log.info(f"  ✅ Signal confirmed: {new_sig.upper()} strength={new_strength} → step {step}: ${amount}")
-
-            won, net = execute_trade(ku, symbol, direction, amount, step)
-            if won:
-                log.info(f"  ✅ Martingale recovered at step {step}!")
-                return
-        except Exception as e:
-            log.error(f"  ❌ Martingale step {step} error: {e}")
-            set_cooldown(symbol)
-            return
-
-    log.warning(f"  ⛔ Martingale exhausted")
-
-# ── Execute a single trade ───────────────────────────
-def execute_trade(ku, symbol, direction, amount, mg_step=0):
-    try:
-        price = ku.get_price(symbol)
-
-        if direction == 'buy':
-            result = ku.buy_market(symbol, amount)
-            base_amount = amount / price
-        else:
-            if symbol in s.open_positions:
-                close_position(ku, symbol)
-                return True, 0
-            else:
-                log.info(f"  ⚠️ Sell signal but no position — skipping")
-                return False, 0
-
-        s.open_positions[symbol] = {
-            'order_id': result,
-            'amount_usd': amount,
-            'amount_base': base_amount,
-            'entry_price': price,
-            'direction': 'buy',
-            'ts': time.time(),
-        }
-
-        label = f"Trade #{s.trades + 1}" if mg_step == 0 else f"Martingale x{mg_step}"
-        log.info(f"  🎯 {label}: {symbol} {direction.upper()} ${amount} @ ${price:.2f}")
-
-        time.sleep(3)
-        won, net = check_and_close(ku, symbol)
-        record_trade(symbol, direction, amount, won, net)
-        return won, net
-
-    except Exception as e:
-        log.error(f"  ❌ Trade error: {e}")
-        return False, -amount
-
-# ── Check open position for TP/SL ────────────────────
-def check_and_close(ku, symbol):
-    pos = s.open_positions.get(symbol)
-    if not pos:
-        return False, -TRADE_USD
-
-    for _ in range(20):
-        try:
-            current = ku.get_price(symbol)
-            pct = (current - pos['entry_price']) / pos['entry_price'] * 100
-
-            if pct >= TAKE_PROFIT_PCT:
-                close_position(ku, symbol)
-                return True, pos.get('realized_pnl', TRADE_USD * 0.85)
-            elif pct <= STOP_LOSS_PCT:
-                close_position(ku, symbol)
-                return False, pos.get('realized_pnl', -pos['amount_usd'])
-        except:
-            pass
-        time.sleep(5)
-
-    close_position(ku, symbol)
-    return False, -pos['amount_usd']
-
-# ── Close position ───────────────────────────────────
-def close_position(ku, symbol):
-    pos = s.open_positions.pop(symbol, None)
-    if not pos:
+# ── Execute Grid Order ───────────────────────────────
+def execute_grid_buy(ku, symbol, level):
+    """Buy at grid level."""
+    if not limits_ok():
+        return
+    if in_cooldown(level['level']):
+        log.info(f"  ⏳ Cooldown on L{level['level']} — skipping")
         return
 
     try:
-        current = ku.get_price(symbol)
-        pnl = (current - pos['entry_price']) * pos['amount_base']
-        pos['realized_pnl'] = pnl
+        price = ku.get_price(symbol)
+        result = ku.buy_market(symbol, GRID_TRADE_USD)
 
+        level['bought'] = True
+        level['buy_actual'] = price
+        level['buy_ts'] = time.time()
+
+        # Get actual fill amount from balance
+        time.sleep(2)
         base = symbol.split('-')[0]
-        result = ku.sell_market(symbol, pos['amount_base'])
-        log.info(f"  ✅ Closed: {symbol} at ${current:.2f} PnL ${pnl:+.2f}")
+        bal = ku.get_balance(base)
+        eth_bought = bal['free'] if bal else GRID_TRADE_USD / price
+
+        log.info(
+            f"  🟢 BUY L{level['level']}: ${GRID_TRADE_USD:.2f} @ ${price:.2f} "
+            f"→ {eth_bought:.6f} {base}"
+        )
+
+        set_cooldown(level['level'])
+        s.save()
     except Exception as e:
-        log.error(f"  ❌ close error: {e}")
-    s.save()
+        log.error(f"  ❌ Buy L{level['level']} error: {e}")
+        level['bought'] = False
 
-# ── Check all open positions ─────────────────────────
-def monitor_positions(ku):
-    for symbol in list(s.open_positions.keys()):
-        pos = s.open_positions[symbol]
-        try:
-            current = ku.get_price(symbol)
-            pct = (current - pos['entry_price']) / pos['entry_price'] * 100
+def execute_grid_sell(ku, symbol, level):
+    """Sell what was bought at this grid level."""
+    if not limits_ok():
+        return
+    if in_cooldown(level['level']):
+        log.info(f"  ⏳ Cooldown on L{level['level']} — skipping")
+        return
 
-            if pct >= TAKE_PROFIT_PCT:
-                log.info(f"  🎯 TP hit: {symbol} +{pct:.2f}%")
-                close_position(ku, symbol)
-            elif pct <= STOP_LOSS_PCT:
-                log.info(f"  🛑 SL hit: {symbol} {pct:.2f}%")
-                close_position(ku, symbol)
-        except Exception as e:
-            log.error(f"  ❌ monitor {symbol}: {e}")
+    try:
+        price = ku.get_price(symbol)
+        base = symbol.split('-')[0]
 
-# ── Main ─────────────────────────────────────────────
+        # Check actual balance to sell
+        bal = ku.get_balance(base)
+        if not bal or bal['free'] <= 0:
+            log.info(f"  ⚠️ No {base} to sell at L{level['level']}")
+            return
+
+        # Sell amount = what was bought (estimated from trade_usd / buy_price)
+        buy_price = level.get('buy_actual', level['buy_price'])
+        estimated_base = GRID_TRADE_USD / buy_price
+
+        # Sell the actual available amount (up to estimated)
+        sell_amount = round(min(estimated_base, bal['free']), 7)
+        if sell_amount <= 0.0000001:
+            log.info(f"  ⚠️ Too small to sell L{level['level']}: {sell_amount}")
+            return
+
+        result = ku.sell_market(symbol, sell_amount)
+
+        # Calculate PnL
+        pnl = (price - buy_price) * sell_amount
+        amount_usd = sell_amount * price
+        profit_pct = calc_profit_pct(buy_price, price)
+        won = pnl > 0
+
+        record_trade(symbol, 'sell', amount_usd, buy_price, price, won, pnl)
+
+        level['bought'] = False
+        if 'buy_actual' in level:
+            del level['buy_actual']
+        if 'buy_ts' in level:
+            del level['buy_ts']
+
+        log.info(
+            f"  🟡 SELL L{level['level']}: {sell_amount:.6f} {base} @ ${price:.2f} "
+            f"PnL ${pnl:+.2f} (+{profit_pct:.1f}%)"
+        )
+
+        set_cooldown(level['level'])
+        s.save()
+    except Exception as e:
+        log.error(f"  ❌ Sell L{level['level']} error: {e}")
+
+# ── Main Loop ────────────────────────────────────────
 def main():
-    global direction
-
     ku = KuCoinClient()
 
     log.info("=" * 60)
     mode = "LIVE" if ku.authed else "PAPER"
-    log.info(f"🤖 KuCoin Trend Trader — {mode}")
-    log.info(f"   Strategy: {CONSECUTIVE}+ consecutive {CANDLE_INTERVAL} → follow trend")
-    log.info(f"   Pairs: {SYMBOLS} | Trade: ${TRADE_USD}")
-    log.info(f"   Martingale: {MARTINGALE_MAX} steps (${TRADE_USD}→${TRADE_USD*MARTINGALE_MULT}→...)")
-    log.info(f"   TP: {TAKE_PROFIT_PCT}% | SL: {STOP_LOSS_PCT}% | Cooldown: {COOLDOWN_SECONDS}s")
+    log.info(f"🤖 KuCoin Grid Trader — {mode}")
+    log.info(f"   Grid: {GRID_LEVELS} levels × {GRID_SPREAD_PCT}% spread")
+    log.info(f"   Trade/level: ${GRID_TRADE_USD}")
+    log.info(f"   Cooldown: {GRID_COOLDOWN}s | Poll: {POLL_SECONDS}s")
     log.info(f"   Daily limits: {MAX_DAILY_TRADES} trades | SL ${DAILY_STOP_LOSS} | TP ${DAILY_TAKE_PROFIT}")
     log.info("=" * 60)
 
@@ -304,124 +277,72 @@ def main():
         except Exception as e:
             log.error(f"❌ Auth failed: {e}")
             ku.authed = False
-        else:
-            # Detect pre-existing ETH balance as sellable position
-            for symbol in SYMBOLS:
-                base = symbol.split('-')[0]
-                try:
-                    bal = ku.get_balance(base)
-                    if bal and bal['free'] > 0:
-                        price = ku.get_price(symbol)
-                        s.open_positions[symbol] = {
-                            'order_id': 'pre-existing',
-                            'amount_usd': bal['free'] * price,
-                            'amount_base': bal['free'],
-                            'entry_price': price,
-                            'direction': 'sell',
-                            'ts': time.time(),
-                            'source': 'pre-existing',
-                        }
-                        log.info(f"  📦 {symbol}: {bal['free']:.6f} {base} ≈ ${bal['free']*price:.2f} (pre-existing, sell-ready)")
-                except Exception as e:
-                    log.warning(f"  ⚠️ Could not load {base} balance: {e}")
 
     session_start = datetime.now()
     heartbeat = 0
+
+    for symbol in SYMBOLS:
+        init_grid(ku, symbol)
 
     while True:
         try:
             s.reset_daily()
 
-            if s.open_positions:
-                monitor_positions(ku)
-
-            if not limits_ok():
-                log.info("🛑 Daily limits reached — waiting...")
-                time.sleep(60)
-                continue
-
             for symbol in SYMBOLS:
-                if in_cooldown(symbol):
+                if not limits_ok():
                     continue
 
                 try:
-                    klines = ku.get_klines(symbol, CANDLE_INTERVAL, CANDLE_COUNT)
-                    price = klines[-1][4] if klines else 0
-                    sig, strength = get_signal(klines, CONSECUTIVE, MIN_CANDLE_RANGE_PCT)
-                    label = signal_label(strength) if sig else "—"
+                    price = ku.get_price(symbol)
 
-                    log.info(
-                        f"⏰ {now_str()} | {symbol} ${price:.2f} | "
-                        f"sig={sig or '—':4s} {label:12s} ({strength})"
-                    )
-
-                    if sig and limits_ok():
-                        if sig == 'buy':
-                            direction = sig
-                            if ku.authed:
-                                won, _ = execute_trade(ku, symbol, 'buy', TRADE_USD, 0)
-                                if not won:
-                                    time.sleep(5)
-                                    martingale_loop(ku, symbol, 'buy')
-                                set_cooldown(symbol)
-                            else:
-                                log.info(f"  📋 [PAPER] would buy ${TRADE_USD} @ ${price:.2f}")
-                                import random
-                                won = random.random() > 0.45
-                                net = TRADE_USD * 0.85 if won else -TRADE_USD
-                                record_trade(symbol, 'buy', TRADE_USD, won, net)
+                    # Rebalance grid if price drifted too far
+                    if time.time() - s.last_rebalance > REBALANCE_INTERVAL:
+                        if s.grid_levels:
+                            center = s.grid_levels[len(s.grid_levels)//2]['buy_price']
+                            if abs(price - center) / center * 100 > REBALANCE_THRESHOLD:
+                                log.info(f"🔄 Price drifted {abs(price - center)/center*100:.1f}% — rebuilding grid")
+                                init_grid(ku, symbol)
                         else:
-                            if symbol in s.open_positions:
-                                pos = s.open_positions[symbol]
-                                # For pre-existing positions, check actual balance before selling
-                                base = symbol.split('-')[0]
-                                if pos.get('source') == 'pre-existing':
-                                    try:
-                                        bal = ku.get_balance(base)
-                                        current = ku.get_price(symbol)
-                                        if bal and bal['free'] > 0:
-                                            # Sell only TRADE_USD worth, keep the rest
-                                            sell_amount = round(TRADE_USD / current, 7)
-                                            if sell_amount > bal['free']:
-                                                sell_amount = round(bal['free'], 7)
-                                            amount_usd = sell_amount * current
-                                            log.info(f"  🎯 Sell pre-existing: {symbol} {sell_amount:.6f} {base} ≈ ${amount_usd:.2f}")
-                                            result = ku.sell_market(symbol, sell_amount)
-                                            pnl = (current - pos['entry_price']) * sell_amount
-                                            record_trade(symbol, 'sell', amount_usd, pnl > 0, pnl)
-                                            # Update position with remaining balance
-                                            bal['free'] -= sell_amount
-                                            if bal['free'] <= 0.000001:
-                                                del s.open_positions[symbol]
-                                                log.info(f"  📦 All {base} sold — position cleared")
-                                            else:
-                                                pos['amount_base'] = bal['free']
-                                                pos['amount_usd'] = bal['free'] * current
-                                                pos['entry_price'] = current
-                                                log.info(f"  📦 Remaining: {bal['free']:.6f} {base} ≈ ${bal['free']*current:.2f}")
-                                            set_cooldown(symbol)
-                                            s.save()
-                                            continue
-                                        else:
-                                            log.info(f"  ⚠️ {base} balance empty — sell skipped")
-                                    except Exception as e:
-                                        log.error(f"  ❌ Sell error: {e}")
-                                else:
-                                    close_position(ku, symbol)
-                            else:
-                                log.info(f"  ℹ️ Sell signal, no open position — skipping")
+                            init_grid(ku, symbol)
+
+                    if not s.grid_levels:
+                        init_grid(ku, symbol)
+
+                    # Show grid status
+                    summary = grid_summary(s.grid_levels, price)
+                    log.info(f"⏰ {now_str()} | {symbol} ${price:.2f} | {summary}")
+
+                    # Check for fills
+                    buys, sells = check_grid_fills(s.grid_levels, price, GRID_MIN_PCT)
+
+                    for level in sells:
+                        if ku.authed:
+                            execute_grid_sell(ku, symbol, level)
+                        else:
+                            buy_price = level.get('buy_actual', level['buy_price'])
+                            net = GRID_TRADE_USD * calc_profit_pct(buy_price, level['sell_price']) / 100
+                            record_trade(symbol, 'sell', GRID_TRADE_USD, buy_price, level['sell_price'], True, net)
+                            level['bought'] = False
+
+                    for level in buys:
+                        if ku.authed:
+                            execute_grid_buy(ku, symbol, level)
+                        else:
+                            log.info(f"  📋 [PAPER] Buy L{level['level']} at ${level['buy_price']:.2f}")
+                            level['bought'] = True
 
                 except Exception as e:
                     log.error(f"  💥 {symbol}: {e}")
 
             heartbeat += 1
-            if heartbeat % 6 == 0:
+            if heartbeat % 12 == 0:
                 mins = (datetime.now() - session_start).total_seconds() / 60
                 wr = s.wins / s.trades * 100 if s.trades else 0
+                active = sum(1 for g in s.grid_levels if g.get('bought')) if s.grid_levels else 0
                 log.info(
                     f"💓 #{s.trades} W:{s.wins} L:{s.losses} "
                     f"WR:{wr:.0f}% Daily ${s.daily_pnl:+.2f} "
-                    f"Total ${s.pnl:+.2f} Open:{len(s.open_positions)} {mins:.0f}min"
+                    f"Total ${s.pnl:+.2f} Grid:{active}/{len(s.grid_levels)} filled | {mins:.0f}min"
                 )
                 s.save()
 

@@ -1,6 +1,6 @@
 """
-KuCoin Trend Trader — Configuration
-Same strategy as IQ Option bot: consecutive candle trend + martingale.
+KuCoin Grid Trader — Configuration
+Automatic buy-sell grid levels for sideways markets.
 """
 import os
 import json
@@ -20,37 +20,34 @@ API_KEY = _creds.get('key', os.getenv('KUCOIN_API_KEY', ''))
 API_SECRET = _creds.get('secret', os.getenv('KUCOIN_API_SECRET', ''))
 API_PASSPHRASE = _creds.get('passphrase', os.getenv('KUCOIN_API_PASSPHRASE', ''))
 
-# ── Trading Pairs (KuCoin format with hyphen) ────────
+# ── Trading Pair ─────────────────────────────────────
 SYMBOLS = ['ETH-USDT']
 DEFAULT_SYMBOL = 'ETH-USDT'
 
-# ── Strategy (adaptive candle + volatility filter) ────
-CANDLE_INTERVAL = '5min'           # 5min = less noise, stronger signals
-CANDLE_COUNT = 48                  # 4 hours of history
-CONSECUTIVE = 3                    # 3+ consecutive = higher conviction
+# ── Grid Configuration ───────────────────────────────
+GRID_CENTRE_PCT = 0          # Grid centered on current price (0%)
+GRID_LEVELS = 6              # Number of buy-sell pairs (6 levels = 12 price lines)
+GRID_SPREAD_PCT = 0.8        # Each grid level spread ±0.8% from center
+GRID_TRADE_USD = 2.20        # Amount per grid order (buy $2.20, sell $2.20+profit)
+GRID_MIN_PCT = 0.15          # Min % move to trigger order (avoids fee loss)
 
-TRADE_USD = 3.50                   # Above min, better fee-to-profit ratio
+# ── Grid Range ───────────────────────────────────────
+# Grid auto-calculates: center_price ± (levels * spread / 2)
+# Example at $1730 with 6 levels × 0.8%: $1730 ± 2.4% → ~$1688-$1772
 
-# Martingale
-MARTINGALE_MAX = 2
-MARTINGALE_MULT = 2
+# ── Timing ───────────────────────────────────────────
+POLL_SECONDS = 15            # Check every 15s
+GRID_COOLDOWN = 30           # Cooldown per grid level after fill (seconds)
 
-# TP/SL — wider to absorb fees, still realistic
-TAKE_PROFIT_PCT = 3.0             # Close at +3% (covers fee 0.2%, net ~2.8%)
-STOP_LOSS_PCT = -2.0              # Close at -2% (risk/reward 1.5:1)
+# ── Rebalance ────────────────────────────────────────
+REBALANCE_INTERVAL = 3600    # Recalculate grid levels every hour
+REBALANCE_THRESHOLD = 2.0    # Recalculate if price moves >2% from center
 
-# Volatility filter — skip if recent candles are too small
-MIN_CANDLE_RANGE_PCT = 0.1        # Skip if latest candle range < 0.1% of price
+# ── Limits ───────────────────────────────────────────
+MAX_DAILY_TRADES = 200
+DAILY_STOP_LOSS = -50
+DAILY_TAKE_PROFIT = 50
 
-# Limits (same as IQ bot)
-MAX_DAILY_TRADES = 10000
-DAILY_STOP_LOSS = -1000
-DAILY_TAKE_PROFIT = 1000
-
-# Timing
-POLL_SECONDS = 15
-COOLDOWN_SECONDS = 300       # 5min — lets the move play out
-
-# ── Files ─────────────────────────────────────────────
+# ── Files ────────────────────────────────────────────
 STATE_FILE = '/opt/baal-agent/workspace/kucoin-bot/bot_state.json'
 LOG_FILE = '/opt/baal-agent/workspace/kucoin-bot/logs/kucoin_bot.log'
