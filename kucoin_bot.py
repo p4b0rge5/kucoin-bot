@@ -46,6 +46,7 @@ class State:
         self.last_date = None
         self.log = []
         self.cooldowns = {}         # {level: timestamp}
+        self.global_cooldown = 0    # Global buy cooldown after any grid buy
         self.grid_levels = []       # Current grid state
         self.last_rebalance = 0    # timestamp
 
@@ -106,6 +107,12 @@ def now_str():
 
 def in_cooldown(level):
     return time.time() < s.cooldowns.get(level, 0)
+
+def global_buy_cooldown():
+    return time.time() < s.global_cooldown
+
+def set_global_buy_cooldown():
+    s.global_cooldown = time.time() + GRID_COOLDOWN
 
 def set_cooldown(level):
     s.cooldowns[level] = time.time() + GRID_COOLDOWN
@@ -171,6 +178,9 @@ def execute_grid_buy(ku, symbol, level):
     """Buy at grid level."""
     if not limits_ok():
         return
+    if global_buy_cooldown():
+        log.info(f"  ⏳ Global cooldown active — buy L{level['level']} delayed")
+        return
     if in_cooldown(level['level']):
         log.info(f"  ⏳ Cooldown on L{level['level']} — skipping")
         return
@@ -195,6 +205,7 @@ def execute_grid_buy(ku, symbol, level):
         )
 
         set_cooldown(level['level'])
+        set_global_buy_cooldown()
         s.save()
     except Exception as e:
         log.error(f"  ❌ Buy L{level['level']} error: {e}")
