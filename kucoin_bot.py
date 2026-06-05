@@ -303,6 +303,26 @@ def main():
         except Exception as e:
             log.error(f"❌ Auth failed: {e}")
             ku.authed = False
+        else:
+            # Detect pre-existing ETH balance as sellable position
+            for symbol in SYMBOLS:
+                base = symbol.split('-')[0]
+                try:
+                    bal = ku.get_balance(base)
+                    if bal and bal['free'] > 0:
+                        price = ku.get_price(symbol)
+                        s.open_positions[symbol] = {
+                            'order_id': 'pre-existing',
+                            'amount_usd': bal['free'] * price,
+                            'amount_base': bal['free'],
+                            'entry_price': price,
+                            'direction': 'sell',
+                            'ts': time.time(),
+                            'source': 'pre-existing',
+                        }
+                        log.info(f"  📦 {symbol}: {bal['free']:.6f} {base} ≈ ${bal['free']*price:.2f} (pre-existing, sell-ready)")
+                except Exception as e:
+                    log.warning(f"  ⚠️ Could not load {base} balance: {e}")
 
     session_start = datetime.now()
     heartbeat = 0
@@ -351,7 +371,42 @@ def main():
                                 record_trade(symbol, 'buy', TRADE_USD, won, net)
                         else:
                             if symbol in s.open_positions:
-                                close_position(ku, symbol)
+                                pos = s.open_positions[symbol]
+                                # For pre-existing positions, check actual balance before selling
+                                base = symbol.split('-')[0]
+                                if pos.get('source') == 'pre-existing':
+                                    try:
+                                        bal = ku.get_balance(base)
+                                        current = ku.get_price(symbol)
+                                        if bal and bal['free'] > 0:
+                                            # Sell only TRADE_USD worth, keep the rest
+                                            sell_amount = TRADE_USD / current
+                                            if sell_amount > bal['free']:
+                                                sell_amount = bal['free']
+                                            amount_usd = sell_amount * current
+                                            log.info(f"  🎯 Sell pre-existing: {symbol} {sell_amount:.6f} {base} ≈ ${amount_usd:.2f}")
+                                            result = ku.sell_market(symbol, sell_amount)
+                                            pnl = (current - pos['entry_price']) * sell_amount
+                                            record_trade(symbol, 'sell', amount_usd, pnl > 0, pnl)
+                                            # Update position with remaining balance
+                                            bal['free'] -= sell_amount
+                                            if bal['free'] <= 0.000001:
+                                                del s.open_positions[symbol]
+                                                log.info(f"  📦 All {base} sold — position cleared")
+                                            else:
+                                                pos['amount_base'] = bal['free']
+                                                pos['amount_usd'] = bal['free'] * current
+                                                pos['entry_price'] = current
+                                                log.info(f"  📦 Remaining: {bal['free']:.6f} {base} ≈ ${bal['free']*current:.2f}")
+                                            set_cooldown(symbol)
+                                            s.save()
+                                            continue
+                                        else:
+                                            log.info(f"  ⚠️ {base} balance empty — sell skipped")
+                                    except Exception as e:
+                                        log.error(f"  ❌ Sell error: {e}")
+                                else:
+                                    close_position(ku, symbol)
                             else:
                                 log.info(f"  ℹ️ Sell signal, no open position — skipping")
 

@@ -21,7 +21,7 @@ API_SECRET = _creds.get('secret', os.getenv('KUCOIN_API_SECRET', ''))
 API_PASSPHRASE = _creds.get('passphrase', os.getenv('KUCOIN_API_PASSPHRASE', ''))
 
 # ── Trading Pairs (KuCoin format with hyphen) ────────
-SYMBOLS = ['ETH-USDT', 'BTC-USDT']
+SYMBOLS = ['ETH-USDT']
 DEFAULT_SYMBOL = 'ETH-USDT'
 
 # ── Strategy (same as IQ bot) ────────────────────────
@@ -29,10 +29,10 @@ CANDLE_INTERVAL = '1min'
 CANDLE_COUNT = 40
 CONSECUTIVE = 2              # 2+ consecutive candles → signal
 
-TRADE_USD = 1                # Per trade in USDT (same as IQ bot)
+TRADE_USD = 1.80              # Min order size ETH-USDT ~$1.76, use $1.80
 
 # Martingale (same as IQ bot)
-MARTINGALE_MAX = 3            # $1 → $2 → $4
+MARTINGALE_MAX = 2            # $1.80 → $3.60
 MARTINGALE_MULT = 2
 
 # TP/SL

@@ -202,8 +202,7 @@ class KuCoinClient:
             'side': 'buy',
             'symbol': symbol,
             'type': 'market',
-            'quoteCurrency': 'USDT',
-            'quoteQuantity': str(quote_amount),
+            'size': str(quote_amount),
         }
         return _signed_request('POST', '/api/v1/orders', body=body)
 
@@ -215,14 +214,11 @@ class KuCoinClient:
             raise Exception("No API credentials")
 
         # Get the base currency from symbol (e.g. ETH-USDT → ETH)
-        base = symbol.split('-')[0]
-
         body = {
             'clientOid': f'kt_{int(time.time()*1000)}',
             'side': 'sell',
             'symbol': symbol,
             'type': 'market',
-            'baseCurrency': base,
-            'baseQuantity': str(base_amount),
+            'size': str(base_amount),
         }
         return _signed_request('POST', '/api/v1/orders', body=body)
