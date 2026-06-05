@@ -3,17 +3,69 @@ KuCoin API client — handles market data and order placement.
 KuCoin returns candles as [timestamp, close, open, high, low, volume, turnover]
 and returns data newest-first (reverse chronological).
 """
+import os
+import sys
 import time
 import hmac
 import hashlib
 import base64
 import json
 import logging
+import subprocess
 import requests
 
 log = logging.getLogger('kucoin_bot')
 
 from config import API_KEY, API_SECRET, API_PASSPHRASE, API_BASE
+
+# ── Tor SOCKS proxy (KuCoin blocks US IPs) ────────────
+TOR_READY = False
+
+def _ensure_tor():
+    """Start Tor if not running, return True when SOCKS proxy is available."""
+    global TOR_READY
+    if TOR_READY:
+        return True
+    try:
+        result = subprocess.run(
+            ['curl', '--socks5', 'localhost:9050', '-s', '-m', '3',
+             'https://api.ipify.org'],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            TOR_READY = True
+            log.info(f"Tor OK — exit IP: {result.stdout.strip()}")
+            return True
+    except Exception:
+        pass
+
+    log.warning("Tor not running — starting...")
+    try:
+        subprocess.Popen(
+            ['tor', '--defaults-only', '-f', '/etc/tor/torrc'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        for _ in range(20):
+            time.sleep(1)
+            try:
+                r = requests.get('https://api.ipify.org',
+                    proxies={'http': 'socks5://localhost:9050',
+                             'https': 'socks5://localhost:9050'},
+                    timeout=5)
+                if r.ok:
+                    TOR_READY = True
+                    log.info(f"Tor started — exit IP: {r.text.strip()}")
+                    return True
+            except Exception:
+                pass
+    except Exception as e:
+        log.error(f"Failed to start Tor: {e}")
+    return TOR_READY
+
+PROXIES = {
+    'http': 'socks5://localhost:9050',
+    'https': 'socks5://localhost:9050',
+}
 
 
 def _sign(msg):
@@ -24,12 +76,15 @@ def _sign(msg):
 
 
 def _signed_request(method, endpoint, body=None):
-    """Authenticated request to KuCoin."""
+    """Authenticated request to KuCoin (via Tor)."""
+    _ensure_tor()
     ts = str(int(time.time() * 1000))
     msg = ts + method.upper() + endpoint
     if body:
         body_str = json.dumps(body)
         msg += body_str
+    else:
+        body_str = None
 
     headers = {
         'KC-API-SIGN': _sign(msg),
@@ -42,9 +97,11 @@ def _signed_request(method, endpoint, body=None):
 
     url = f'{API_BASE}{endpoint}'
     if method.upper() == 'POST':
-        r = requests.post(url, data=body_str, headers=headers, timeout=15)
+        r = requests.post(url, data=body_str, headers=headers,
+                          timeout=30, proxies=PROXIES)
     else:
-        r = requests.request(method, url, headers=headers, timeout=15)
+        r = requests.request(method, url, headers=headers,
+                             timeout=30, proxies=PROXIES)
 
     data = r.json()
     if data.get('code') != '200000':
@@ -53,8 +110,9 @@ def _signed_request(method, endpoint, body=None):
 
 
 def _public_get(endpoint):
-    """Unauthenticated GET."""
-    r = requests.get(f'{API_BASE}{endpoint}', timeout=15)
+    """Unauthenticated GET (via Tor)."""
+    _ensure_tor()
+    r = requests.get(f'{API_BASE}{endpoint}', timeout=30, proxies=PROXIES)
     data = r.json()
     if data.get('code') != '200000':
         raise Exception(f"KuCoin GET {endpoint}: {data.get('msg', data)}")
