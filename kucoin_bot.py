@@ -20,6 +20,7 @@ from config import (
     MAX_DAILY_TRADES, DAILY_STOP_LOSS, DAILY_TAKE_PROFIT,
     TAKE_PROFIT_PCT, STOP_LOSS_PCT, STATE_FILE, LOG_FILE,
     MARTINGALE_MAX, MARTINGALE_MULT,
+    MIN_CANDLE_RANGE_PCT,
 )
 from strategy import get_signal, signal_label
 from kucoin import KuCoinClient
@@ -156,7 +157,7 @@ def martingale_loop(ku, symbol, direction):
 
         try:
             klines = ku.get_klines(symbol, CANDLE_INTERVAL, CANDLE_COUNT)
-            new_sig, new_strength = get_signal(klines, CONSECUTIVE)
+            new_sig, new_strength = get_signal(klines, CONSECUTIVE, MIN_CANDLE_RANGE_PCT)
 
             if new_sig is None or new_sig != direction:
                 log.info(f"  ⛔ Signal changed (got: {new_sig}/{new_strength}), aborting martingale")
@@ -346,7 +347,7 @@ def main():
                 try:
                     klines = ku.get_klines(symbol, CANDLE_INTERVAL, CANDLE_COUNT)
                     price = klines[-1][4] if klines else 0
-                    sig, strength = get_signal(klines, CONSECUTIVE)
+                    sig, strength = get_signal(klines, CONSECUTIVE, MIN_CANDLE_RANGE_PCT)
                     label = signal_label(strength) if sig else "—"
 
                     log.info(
@@ -380,9 +381,9 @@ def main():
                                         current = ku.get_price(symbol)
                                         if bal and bal['free'] > 0:
                                             # Sell only TRADE_USD worth, keep the rest
-                                            sell_amount = TRADE_USD / current
+                                            sell_amount = round(TRADE_USD / current, 7)
                                             if sell_amount > bal['free']:
-                                                sell_amount = bal['free']
+                                                sell_amount = round(bal['free'], 7)
                                             amount_usd = sell_amount * current
                                             log.info(f"  🎯 Sell pre-existing: {symbol} {sell_amount:.6f} {base} ≈ ${amount_usd:.2f}")
                                             result = ku.sell_market(symbol, sell_amount)

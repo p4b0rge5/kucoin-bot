@@ -197,6 +197,9 @@ class KuCoinClient:
         if not self.authed:
             raise Exception("No API credentials")
 
+        # Round to 6 decimal places (quoteIncrement for USDT)
+        quote_amount = round(quote_amount, 6)
+
         body = {
             'clientOid': f'kt_{int(time.time()*1000)}',
             'side': 'buy',
@@ -213,7 +216,9 @@ class KuCoinClient:
         if not self.authed:
             raise Exception("No API credentials")
 
-        # Get the base currency from symbol (e.g. ETH-USDT → ETH)
+        # Round to 7 decimal places (safe for most baseIncrements like 0.0000001)
+        base_amount = round(base_amount, 7)
+
         body = {
             'clientOid': f'kt_{int(time.time()*1000)}',
             'side': 'sell',

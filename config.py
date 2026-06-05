@@ -24,20 +24,23 @@ API_PASSPHRASE = _creds.get('passphrase', os.getenv('KUCOIN_API_PASSPHRASE', '')
 SYMBOLS = ['ETH-USDT']
 DEFAULT_SYMBOL = 'ETH-USDT'
 
-# ── Strategy (same as IQ bot) ────────────────────────
-CANDLE_INTERVAL = '1min'
-CANDLE_COUNT = 40
-CONSECUTIVE = 2              # 2+ consecutive candles → signal
+# ── Strategy (adaptive candle + volatility filter) ────
+CANDLE_INTERVAL = '5min'           # 5min = less noise, stronger signals
+CANDLE_COUNT = 48                  # 4 hours of history
+CONSECUTIVE = 3                    # 3+ consecutive = higher conviction
 
-TRADE_USD = 1.80              # Min order size ETH-USDT ~$1.76, use $1.80
+TRADE_USD = 3.50                   # Above min, better fee-to-profit ratio
 
-# Martingale (same as IQ bot)
-MARTINGALE_MAX = 2            # $1.80 → $3.60
+# Martingale
+MARTINGALE_MAX = 2
 MARTINGALE_MULT = 2
 
-# TP/SL
-TAKE_PROFIT_PCT = 1.5        # Close at +1.5%
-STOP_LOSS_PCT = -1.0         # Close at -1.0%
+# TP/SL — wider to absorb fees, still realistic
+TAKE_PROFIT_PCT = 3.0             # Close at +3% (covers fee 0.2%, net ~2.8%)
+STOP_LOSS_PCT = -2.0              # Close at -2% (risk/reward 1.5:1)
+
+# Volatility filter — skip if recent candles are too small
+MIN_CANDLE_RANGE_PCT = 0.1        # Skip if latest candle range < 0.1% of price
 
 # Limits (same as IQ bot)
 MAX_DAILY_TRADES = 10000
@@ -45,8 +48,8 @@ DAILY_STOP_LOSS = -1000
 DAILY_TAKE_PROFIT = 1000
 
 # Timing
-POLL_SECONDS = 10
-COOLDOWN_SECONDS = 120       # Same as IQ bot
+POLL_SECONDS = 15
+COOLDOWN_SECONDS = 300       # 5min — lets the move play out
 
 # ── Files ─────────────────────────────────────────────
 STATE_FILE = '/opt/baal-agent/workspace/kucoin-bot/bot_state.json'
